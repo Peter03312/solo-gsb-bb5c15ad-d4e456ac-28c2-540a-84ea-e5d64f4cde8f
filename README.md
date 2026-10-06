@@ -334,6 +334,11 @@ PORT=8080 docker compose up --build -d
 
 ## HTTP API 摘要（均返回 JSON，会话用 Cookie 或 `Authorization: Bearer <token>`）
 
+> **双凭证判定**：请求带 `Authorization: Bearer <token>` 时**只按该令牌认证**——令牌无效或过期直接
+> `401 UNAUTHORIZED`，**不回退**到 Cookie；仅在未带 Bearer 时才沿用 `session` Cookie。
+> `/api/logout` 只撤销**本次实际认证所用**的令牌：Bearer 退出不清除浏览器里另一有效 Cookie，
+> Cookie 退出才清除该 Cookie。
+
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | POST | `/api/login` · `/api/logout` | 登录 / 退出 |
@@ -405,6 +410,55 @@ PORT=8080 docker compose up --build -d
 
 日程列表响应（导演与演员）均带 `notification` 摘要：导演见 `{id, seq, status, expected, confirmed, pending}`
 （仅当前批次计 `pending`）；演员见 `{id, seq, myState, confirmedAt}`（本人不在当前批次接收人中或无批次时为 `null`）。
+
+## Cookie 与 Bearer 双凭证调用示例（curl）
+
+登录成功后服务器同时下发 `session` Cookie 与响应体中的 `token`（可作 Bearer 用）。
+浏览器默认带 Cookie；脚本/API 客户端一般用 `-H "Authorization: Bearer <token>"`。
+**带 Bearer 时绝不回退 Cookie**，因此可以安全地在持有导演 Cookie 的浏览器环境之外，用演员令牌调演员接口。
+
+```bash
+# 0. 两个账号分别登录，各自拿到令牌（登录响应同时 Set-Cookie: session=<token>）
+curl -s -X POST http://localhost:3000/api/login -H 'Content-Type: application/json' \
+  -d '{"username":"director","password":"director123"}'   # -> {"token":"<DIRECTOR_TOKEN>",...}
+curl -s -X POST http://localhost:3000/api/login -H 'Content-Type: application/json' \
+  -d '{"username":"lin","password":"actor123"}'           # -> {"token":"<ACTOR_TOKEN>",...}
+
+# 1. 单凭证：只带 Cookie，沿用 Cookie 身份（浏览器行为）
+curl -s http://localhost:3000/api/me -H "Cookie: session=<DIRECTOR_TOKEN>"
+# -> {"user":{"username":"director","role":"director",...}}
+curl -s http://localhost:3000/api/me -H "Authorization: Bearer <ACTOR_TOKEN>"
+# -> {"user":{"username":"lin","role":"actor",...}}
+
+# 2. 双凭证：浏览器持有导演 Cookie，但请求显式带演员 Bearer —— 只认 Bearer，不被 Cookie 覆盖
+curl -s http://localhost:3000/api/me \
+  -H "Cookie: session=<DIRECTOR_TOKEN>" \
+  -H "Authorization: Bearer <ACTOR_TOKEN>"
+# -> {"user":{"username":"lin","role":"actor",...}}
+#    用该组合调演员私有接口（如本人通知/结算明细）也是演员身份，不会串成导演；
+#    用它调导演接口（如 /api/actors）返回 403，权限隔离不受影响。
+
+# 3. 无效 Bearer 不借 Cookie 通过：即使同请求带有效导演 Cookie，仍直接 401
+curl -s -o /dev/null -w '%{http_code}\n' http://localhost:3000/api/me \
+  -H "Cookie: session=<DIRECTOR_TOKEN>" \
+  -H "Authorization: Bearer not-a-real-token"
+# -> 401
+#    过期/已撤销的 Bearer 同理（401），不会回退到 Cookie 身份。
+
+# 4. 以 Bearer 退出：只撤销该 Bearer 令牌，不清除另一条有效 Cookie
+curl -s -X POST http://localhost:3000/api/logout \
+  -H "Cookie: session=<DIRECTOR_TOKEN>" \
+  -H "Authorization: Bearer <ACTOR_TOKEN>"
+# -> {"ok":true}
+curl -s http://localhost:3000/api/me -H "Authorization: Bearer <ACTOR_TOKEN>"   # 401（令牌已撤销）
+curl -s http://localhost:3000/api/me -H "Cookie: session=<DIRECTOR_TOKEN>"      # 200（导演 Cookie 仍有效）
+
+# 5. 以 Cookie 退出：撤销该会话并清除 Cookie（响应含 Set-Cookie: session=; Max-Age=0）
+curl -s -i -X POST http://localhost:3000/api/logout -H "Cookie: session=<DIRECTOR_TOKEN>"
+# -> HTTP/1.1 200 ...  Set-Cookie: session=; Path=/; Expires=Thu, 01 Jan 1970 ...
+curl -s -o /dev/null -w '%{http_code}\n' http://localhost:3000/api/me -H "Cookie: session=<DIRECTOR_TOKEN>"
+# -> 401
+```
 
 ## 日程接口调用示例（curl）
 

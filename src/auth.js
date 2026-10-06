@@ -18,20 +18,33 @@ function publicUser(u) {
   return { id: u.id, username: u.username, role: u.role, displayName: u.display_name };
 }
 
-/** 会话中间件：支持 Cookie 与 Authorization: Bearer 两种方式 */
+/**
+ * 会话中间件：支持 Cookie 与 Authorization: Bearer 两种方式。
+ * 判定规则（不做凭证回退，避免双凭证时身份串用）：
+ * - 请求带 Bearer 令牌时，只按该令牌认证；令牌无效/过期一律 401，不回退 Cookie；
+ * - 请求未带 Bearer 令牌时，才沿用 session Cookie。
+ */
 function authRequired(req, res, next) {
-  let token = null;
   const header = req.headers.authorization;
-  if (header && header.startsWith('Bearer ')) token = header.slice(7);
-  if (req.cookies && req.cookies.session) token = req.cookies.session;
+  let token = null;
+  let via = null;
+  if (header && (header === 'Bearer' || header.startsWith('Bearer '))) {
+    // 只要声明了 Bearer 方案，就只认其后的令牌；空令牌同样按无效处理，不回退 Cookie
+    token = header.slice('Bearer'.length).trim();
+    via = 'bearer';
+  } else if (req.cookies && req.cookies.session) {
+    token = req.cookies.session;
+    via = 'cookie';
+  }
   if (!token) return next(unauthorized());
 
-  const session = db.prepare('SELECT * FROM sessions WHERE token = ?', token).get(token);
+  const session = db.prepare('SELECT * FROM sessions WHERE token = ?').get(token);
   if (!session || new Date(session.expires_at).getTime() < Date.now()) return next(unauthorized());
   const user = db.prepare('SELECT * FROM users WHERE id = ?').get(session.user_id);
   if (!user) return next(unauthorized());
   req.user = user;
   req.sessionToken = token;
+  req.authVia = via;
   next();
 }
 
@@ -68,8 +81,11 @@ router.post(
 );
 
 router.post('/logout', authRequired, (req, res) => {
+  // 仅撤销本次实际认证所用的会话令牌：
+  // - Bearer 退出：只删该令牌，不清除浏览器可能同时持有的另一有效 Cookie；
+  // - Cookie 退出：删除该会话并清除 Cookie。
   db.prepare('DELETE FROM sessions WHERE token = ?').run(req.sessionToken);
-  res.clearCookie('session');
+  if (req.authVia === 'cookie') res.clearCookie('session');
   res.json({ ok: true });
 });
 

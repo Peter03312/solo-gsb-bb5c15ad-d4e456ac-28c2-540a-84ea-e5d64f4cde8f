@@ -40,6 +40,19 @@ async function login(u, p) {
   return r.token;
 }
 
+// 可自定义原始请求头（用于双凭证：Cookie + Bearer）
+async function rawReq(method, p, { headers = {}, body } = {}) {
+  const res = await fetch(BASE + p, {
+    method,
+    headers,
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const text = await res.text();
+  let json = null;
+  try { json = JSON.parse(text); } catch { /* */ }
+  return { status: res.status, json, setCookie: res.headers.get('set-cookie') || '' };
+}
+
 async function main() {
   console.log('— 认证与越权 —');
   await J('/api/login', null, { username: 'director', password: 'wrong' }, 401);
@@ -51,6 +64,64 @@ async function main() {
   await J('/api/plays', lin, { title: 'x' }, 403);
   await G('/api/actors', lin, 403);
   check('错误密码 401 / 未登录 401 / 演员越权导演接口 403', true);
+
+  console.log('— 双凭证判定（Cookie 与 Bearer 不互相回退）—');
+  // 单独再开两个会话，避免影响后续测试中 director / lin 令牌的使用
+  const dirCookieToken = await login('director', 'director123');
+  const actorBearerToken = await login('lin', 'actor123');
+  // Bearer 显式存在时只认 Bearer，不被 Cookie 覆盖
+  const dualMe = await rawReq('GET', '/api/me', {
+    headers: { Cookie: `session=${dirCookieToken}`, Authorization: `Bearer ${actorBearerToken}` },
+  });
+  check('双凭证时 Bearer 优先（返回演员身份）',
+    dualMe.status === 200 && dualMe.json.user.username === 'lin' && dualMe.json.user.role === 'actor',
+    JSON.stringify(dualMe));
+  // 双凭证下调演员私有接口仍是演员；调导演接口 403
+  const dualActors = await rawReq('GET', '/api/actors', {
+    headers: { Cookie: `session=${dirCookieToken}`, Authorization: `Bearer ${actorBearerToken}` },
+  });
+  check('双凭证调导演接口按 Bearer 身份判 403', dualActors.status === 403, String(dualActors.status));
+  const dualNotif = await rawReq('GET', '/api/me/schedule-notifications', {
+    headers: { Cookie: `session=${dirCookieToken}`, Authorization: `Bearer ${actorBearerToken}` },
+  });
+  check('双凭证可调演员私有接口', dualNotif.status === 200, String(dualNotif.status));
+  // 无效 Bearer 不借 Cookie 通过
+  const badBearer = await rawReq('GET', '/api/me', {
+    headers: { Cookie: `session=${dirCookieToken}`, Authorization: 'Bearer not-a-real-token' },
+  });
+  check('无效 Bearer 即使带有效 Cookie 也 401', badBearer.status === 401, String(badBearer.status));
+  const emptyBearer = await rawReq('GET', '/api/me', {
+    headers: { Cookie: `session=${dirCookieToken}`, Authorization: 'Bearer ' },
+  });
+  check('空 Bearer 不回退 Cookie（401）', emptyBearer.status === 401, String(emptyBearer.status));
+  // 无 Bearer 时沿用 Cookie
+  const cookieMe = await rawReq('GET', '/api/me', { headers: { Cookie: `session=${dirCookieToken}` } });
+  check('无 Bearer 时沿用 Cookie 身份', cookieMe.status === 200 && cookieMe.json.user.role === 'director');
+  // Bearer 退出：只撤销 Bearer 令牌，不清除/撤销导演 Cookie
+  const bearerLogout = await rawReq('POST', '/api/logout', {
+    headers: { Cookie: `session=${dirCookieToken}`, Authorization: `Bearer ${actorBearerToken}` },
+  });
+  check('Bearer 退出 200 且不清除 Cookie',
+    bearerLogout.status === 200 && !/set-cookie/i.test(bearerLogout.setCookie), bearerLogout.setCookie);
+  const revokedBearer = await rawReq('GET', '/api/me', {
+    headers: { Authorization: `Bearer ${actorBearerToken}` },
+  });
+  check('Bearer 令牌退出后已撤销（401）', revokedBearer.status === 401, String(revokedBearer.status));
+  const cookieAfterBearerLogout = await rawReq('GET', '/api/me', {
+    headers: { Cookie: `session=${dirCookieToken}` },
+  });
+  check('Bearer 退出后另一 Cookie 仍有效',
+    cookieAfterBearerLogout.status === 200 && cookieAfterBearerLogout.json.user.role === 'director');
+  // Cookie 退出：撤销会话并清除 Cookie
+  const cookieLogout = await rawReq('POST', '/api/logout', {
+    headers: { Cookie: `session=${dirCookieToken}` },
+  });
+  check('Cookie 退出 200 且响应清除 Cookie',
+    cookieLogout.status === 200 && /^session=;?/i.test(cookieLogout.setCookie), cookieLogout.setCookie);
+  const cookieAfterLogout = await rawReq('GET', '/api/me', {
+    headers: { Cookie: `session=${dirCookieToken}` },
+  });
+  check('Cookie 退出后该会话已撤销（401）', cookieAfterLogout.status === 401, String(cookieAfterLogout.status));
 
   console.log('— 种子数据 —');
   const { plays } = await G('/api/plays', director);
