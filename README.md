@@ -406,6 +406,52 @@ PORT=8080 docker compose up --build -d
 日程列表响应（导演与演员）均带 `notification` 摘要：导演见 `{id, seq, status, expected, confirmed, pending}`
 （仅当前批次计 `pending`）；演员见 `{id, seq, myState, confirmedAt}`（本人不在当前批次接收人中或无批次时为 `null`）。
 
+## 会话与双凭证（Cookie + Bearer）调用示例（curl）
+
+登录成功后服务器同时下发两件等价凭证：`Set-Cookie: session=<token>`（httpOnly，浏览器自动携带）
+与响应体中的 `{"token":"<token>"}`（供脚本/客户端放入 `Authorization: Bearer <token>`）。
+两者各自对应一条独立会话，**按以下规则判定身份**：
+
+- 请求带 `Authorization: Bearer …` 时，**只按该 Bearer 令牌认证**；令牌无效、已撤销或为空一律 `401`，
+  **不会回退使用 Cookie**——因此浏览器里虽有导演 Cookie，带演员令牌调用也会准确返回演员身份；
+  无效令牌不会借 Cookie 通过。
+- 请求未带 Bearer 时，沿用 `Cookie: session=…` 认证；两者都没有则 `401`。
+- `POST /api/logout` 只撤销**本次实际认证所用的那一个令牌**：
+  - 用 Bearer 退出：仅该令牌失效，不清除浏览器中另一条仍有效的 Cookie 会话；
+  - 用 Cookie 退出：该会话失效，响应同时带 `Set-Cookie` 清除浏览器 Cookie。
+
+```bash
+# 1. 导演在浏览器登录（自动持有导演 Cookie）；演员在脚本里登录拿 Bearer
+curl -s -X POST http://localhost:3000/api/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"lin","password":"actor123"}'
+# -> {"token":"<ACTOR_TOKEN>","expiresAt":"...","user":{"role":"actor",...}}
+
+# 2. 浏览器同时带着导演 Cookie 和演员 Bearer：身份以 Bearer 为准（返回演员林晚，而非导演）
+curl -s http://localhost:3000/api/me \
+  -H 'Cookie: session=<DIRECTOR_COOKIE_TOKEN>' \
+  -H 'Authorization: Bearer <ACTOR_TOKEN>'
+# -> {"user":{"username":"lin","role":"actor",...}}
+
+# 3. Bearer 无效即 401，即使 Cookie 是导演的有效会话也不回退、不放行
+curl -s -o /dev/null -w '%{http_code}\n' http://localhost:3000/api/me \
+  -H 'Cookie: session=<DIRECTOR_COOKIE_TOKEN>' \
+  -H 'Authorization: Bearer not-a-real-token'
+# -> 401
+
+# 4. 不带 Bearer 时照旧走 Cookie（仅浏览器场景，返回导演）
+curl -s http://localhost:3000/api/me -H 'Cookie: session=<DIRECTOR_COOKIE_TOKEN>'
+# -> {"user":{"username":"director","role":"director",...}}
+
+# 5. 用演员 Bearer 退出：只撤销该令牌，响应不清除 Cookie；导演 Cookie 会话仍可继续使用
+curl -s -X POST http://localhost:3000/api/logout -H 'Authorization: Bearer <ACTOR_TOKEN>'
+# -> {"ok":true}   （响应无 Set-Cookie，导演 Cookie 不受影响）
+
+# 6. 用 Cookie 退出：撤销该会话并清除浏览器 Cookie
+curl -s -X POST http://localhost:3000/api/logout -H 'Cookie: session=<DIRECTOR_COOKIE_TOKEN>'
+# -> {"ok":true}，响应头：Set-Cookie: session=; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT
+```
+
 ## 日程接口调用示例（curl）
 
 ```bash
